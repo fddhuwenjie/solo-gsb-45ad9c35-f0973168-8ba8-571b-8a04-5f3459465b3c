@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -9,8 +11,9 @@ from ..events.service import (
     commit_and_publish,
 )
 from ..locking import writer_lock
-from ..models import Match, Round
+from ..models import Match, Round, RoundClock
 from ..schemas import ResultUpdate, RoundResponse
+from ..services.clock import match_deadline
 from ..services.rounds import generate_next_round
 from .tournaments import get_tournament_or_404, serialize_round
 
@@ -118,6 +121,18 @@ def submit_result(
         round_obj = db.get(Round, match.round_id)
         if round_obj.status != "open":
             raise HTTPException(status_code=409, detail="该轮次已结束，不能修改赛果")
+
+        # 本轮已启动计时时，晚于该场截止时刻的提交拒绝（暂停中按
+        # 冻结后的有效截止时刻判定）
+        clock = db.get(RoundClock, round_obj.id)
+        if clock is not None:
+            now = datetime.utcnow()
+            deadline = match_deadline(clock, match.id, now)
+            if deadline is not None and now > deadline:
+                raise HTTPException(
+                    status_code=409,
+                    detail="已超过该场对局的截止时刻，不能录入赛果",
+                )
 
         match.score_white = sw
         match.score_black = sb

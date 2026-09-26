@@ -25,6 +25,10 @@ ROUND_GENERATED = "round.generated"
 RESULT_SUBMITTED = "result.submitted"
 ROUND_CLOSED = "round.closed"
 STATION_PLAN_PUBLISHED = "station_plan.published"
+CLOCK_STARTED = "clock.started"
+CLOCK_PAUSED = "clock.paused"
+CLOCK_RESUMED = "clock.resumed"
+CLOCK_EXTENDED = "clock.extended"
 
 
 def _allocate_next_seq(db: Session, tournament_id: int) -> int:

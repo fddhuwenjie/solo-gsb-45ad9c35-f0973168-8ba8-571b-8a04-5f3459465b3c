@@ -4,6 +4,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     JSON,
@@ -121,6 +122,11 @@ class Round(Base):
         cascade="all, delete-orphan",
         order_by="StationPlan.version",
     )
+    clock: Mapped["RoundClock | None"] = relationship(
+        back_populates="round",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class Match(Base):
@@ -214,6 +220,72 @@ class StationPlanAssignment(Base):
     station_no: Mapped[int] = mapped_column(Integer, nullable=False)
 
     plan: Mapped[StationPlan] = relationship(back_populates="assignments")
+
+
+class RoundClock(Base):
+    """一轮的持久化计时状态（每轮至多一行，start 命令时创建）。
+
+    剩余时间不做逐秒写库：由 started_at 锚点、累计暂停时长
+    （accumulated_pause_seconds；paused_at 为进行中暂停的起点）
+    加上 duration_seconds 与各场加时（extensions）在读取时推算，
+    容器重启后读数自然连续。每次成功命令把 version 加 1，供
+    expected_version 乐观并发控制。
+    """
+
+    __tablename__ = "round_clocks"
+
+    round_id: Mapped[int] = mapped_column(
+        ForeignKey("rounds.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # 计时版本：从 1 开始（行创建即 1），每次成功命令 +1
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # running / paused（行在 start 时创建，故无持久化的 not_started 态）
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 总时长（秒）：start 设定，各场截止时刻的共同基准
+    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 计时启动的 UTC 锚点（naive UTC）
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # 暂停中的 UTC 起点；非暂停状态为 NULL
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 已结算的累计暂停时长（秒）
+    accumulated_pause_seconds: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0
+    )
+    # 每场对局的累计加时：{str(match_id): 秒}
+    extensions: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+    round: Mapped[Round] = relationship(back_populates="clock")
+
+
+class ClockAction(Base):
+    """计时命令幂等日志：同一轮内 request_id 唯一。
+
+    成功应用的命令把请求指纹与响应快照随业务变更在同一事务落库：
+    重复 request_id 且指纹一致时原样返回快照（不重复执行、不重复
+    发事件、版本不再递增）；指纹不一致返回 409。
+    """
+
+    __tablename__ = "clock_actions"
+    __table_args__ = (
+        UniqueConstraint("round_id", "request_id", name="uq_clock_action_request"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    round_id: Mapped[int] = mapped_column(
+        ForeignKey("rounds.id", ondelete="CASCADE"), nullable=False
+    )
+    # 客户端请求标识（轮次内唯一）
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 请求载荷指纹（sha256）：区分「重放」与「同号不同请求」
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 已应用的命令：start / pause / resume / extend
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 首次应用时的响应快照（JSON），重放时原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
 
 
 class EventCounter(Base):

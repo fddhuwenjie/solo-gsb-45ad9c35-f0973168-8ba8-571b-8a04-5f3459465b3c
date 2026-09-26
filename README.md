@@ -20,7 +20,13 @@
   `event_counters` 计数器行在事务内原子分配（`INSERT ... ON CONFLICT
   DO UPDATE ... RETURNING`），并发提交同样唯一且连续；现场大屏/解说端
   可订阅实时推送，断线后凭 `Last-Event-ID` 精确续传，并提供按序号
-  分页查询的历史事件接口。
+  分页查询的历史事件接口；
+- **持久化轮次计时**：轮次生成后通过 `start / pause / resume / extend`
+  命令控制计时，`request_id` 幂等、`expected_version` 乐观并发；
+  剩余时间由服务端 UTC 锚点与累计暂停时长在读取时推算，不运行逐秒
+  写库任务，容器重启后读数连续；全局暂停冻结所有对局，`extend`
+  只给指定非轮空对局加时；晚于该场截止时刻的赛果提交被拒绝，
+  已提交赛果与已结束轮次不受后续命令影响。
 
 配对在 Edmonds 带花树（Blossom）最小权完美匹配算法上实现
 （`networkx.min_weight_matching`，O(n³)），同代价方案用可加的
@@ -198,7 +204,8 @@ data: {"tournament_id": 1, "seq": 6, "type": "round.generated",
   `SSE_HEARTBEAT_SECONDS`），防止代理断开空闲连接；
 - 事件类型：`tournament.created`、`participant.registered`、
   `round.generated`、`result.submitted`、`round.closed`、
-  `station_plan.published`；
+  `station_plan.published`、`clock.started`、`clock.paused`、
+  `clock.resumed`、`clock.extended`；
 - 事件与业务变更在**同一数据库事务**中写入：事务回滚则事件一并
   回滚，不会出现"有事件无变更"或"有变更无事件"；
 - **并发安全**：事件序号不再"查询最大 seq 后插入"，而是对
@@ -338,6 +345,83 @@ curl http://localhost:8000/tournaments/1/rounds/1/station-plans
 curl http://localhost:8000/tournaments/1/rounds/1/station-plans/1
 ```
 
+### 10. 轮次计时（持久化时钟）
+
+轮次生成后可为该轮启动计时。所有计时命令走同一入口
+`POST /tournaments/{id}/rounds/{round_no}/clock/actions`，请求体：
+
+- `request_id`：客户端请求标识（轮次内唯一）。**重复提交同一
+  `request_id`（载荷完全一致）返回首次的结果**，不重复执行、不重复
+  发事件；同一 `request_id` 携带不同载荷返回 `409`；
+- `expected_version`：期望的当前计时版本（未开始为 `0`，GET 时钟
+  可查当前版本），不一致返回 `409` 且不落库；
+- `action`：`start` / `pause` / `resume` / `extend`；
+  - `start` 需带 `duration_seconds`（总时长，秒），每轮只能启动一次；
+  - `pause` / `resume` 为全局暂停 / 恢复：暂停冻结**所有**对局的
+    剩余时间，恢复后延续；
+  - `extend` 需带 `match_id` 与 `extra_seconds`，只给指定的**非轮空、
+    未提交赛果**的对局加时，可多次累计。
+
+```bash
+# 启动计时：总时长 30 分钟（版本 0 -> 1）
+curl -X POST http://localhost:8000/tournaments/1/rounds/1/clock/actions \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "r1-c1", "expected_version": 0,
+       "action": "start", "duration_seconds": 1800}'
+
+# 全局暂停 / 恢复（版本递增）
+curl -X POST http://localhost:8000/tournaments/1/rounds/1/clock/actions \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "r1-c2", "expected_version": 1, "action": "pause"}'
+curl -X POST http://localhost:8000/tournaments/1/rounds/1/clock/actions \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "r1-c3", "expected_version": 2, "action": "resume"}'
+
+# 只给第 1 场对局加时 5 分钟
+curl -X POST http://localhost:8000/tournaments/1/rounds/1/clock/actions \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "r1-c4", "expected_version": 3,
+       "action": "extend", "match_id": 1, "extra_seconds": 300}'
+
+# 查询时钟：版本、状态、各场截止时刻与剩余秒数
+curl http://localhost:8000/tournaments/1/rounds/1/clock
+```
+
+```json
+{
+  "round_id": 1, "round_no": 1, "version": 4, "status": "running",
+  "duration_seconds": 1800,
+  "started_at": "2026-09-26T08:40:00.000000Z",
+  "paused_at": null,
+  "accumulated_pause_seconds": 62.5,
+  "server_time": "2026-09-26T08:45:10.000000Z",
+  "matches": [
+    {"match_id": 1, "extra_seconds": 300,
+     "deadline": "2026-09-26T09:16:02.500000Z",
+     "remaining_seconds": 1852.5},
+    {"match_id": 2, "extra_seconds": 0,
+     "deadline": "2026-09-26T09:11:02.500000Z",
+     "remaining_seconds": 1552.5}
+  ]
+}
+```
+
+计时规则：
+
+- **持久化推算**：剩余时间由服务端 UTC 锚点（`started_at`）+ 累计
+  暂停时长（`accumulated_pause_seconds`，暂停中为冻结值）推算，
+  **不运行逐秒写库的后台任务**，容器重启后读数自然连续；
+- **截止约束**：赛果提交晚于该场截止时刻返回 `409`（暂停期间按
+  冻结后的有效截止时刻判定）；未启动计时的轮次不受约束；
+- **终态保护**：已提交赛果的对局不能再加时；轮次结束后一切计时
+  命令返回 `409`，已提交赛果与已结束轮次不受后续命令影响；
+- **非法状态**：重复 `start`、未开始时 `pause/resume/extend`、
+  暂停中再 `pause` 等返回 `409` 且不落库；缺参数返回 `422`；
+- **事件同事务**：每个成功命令与对应 `clock.started` /
+  `clock.paused` / `clock.resumed` / `clock.extended` 事件在同一
+  数据库事务提交，SSE 订阅者与事件分页接口立即可见；命令失败
+  （409/422）不产生任何事件与版本变化。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -359,6 +443,8 @@ curl http://localhost:8000/tournaments/1/rounds/1/station-plans/1
 | POST | `/tournaments/{id}/rounds/{round_no}/station-plans` | 发布该轮工位方案（新版本） |
 | GET | `/tournaments/{id}/rounds/{round_no}/station-plans` | 该轮全部工位方案版本 |
 | GET | `/tournaments/{id}/rounds/{round_no}/station-plans/{version}` | 指定版本的工位方案 |
+| POST | `/tournaments/{id}/rounds/{round_no}/clock/actions` | 计时命令（start/pause/resume/extend，幂等 + 乐观并发） |
+| GET | `/tournaments/{id}/rounds/{round_no}/clock` | 时钟：版本、状态、各场截止时刻与剩余秒数 |
 | PUT | `/matches/{match_id}/result` | 录入/修改一场赛果 |
 | GET | `/tournaments/{id}/standings` | 排名（含 Buchholz 分） |
 | GET | `/tournaments/{id}/events/stream` | SSE 事件流（支持 `Last-Event-ID` 续传、心跳注释） |
@@ -414,7 +500,11 @@ pytest
 独立序贯校验，端到端 API 流程（含轮空轮换、重复对阵检测、
 赛果校验、自动封盘），工位模块专项（工位维护、必需标签登记、
 固定工位校验 409 不落库、最多分配/最少换位/字典序裁决、容量
-不足的部分方案与原因说明、版本化查询与事件发布），以及事件流
+不足的部分方案与原因说明、版本化查询与事件发布），轮次计时专项
+（启动/暂停/恢复/加时的状态机与版本递增、暂停冻结与恢复延续、
+request_id 幂等重放与同号异载荷 409、版本冲突与非法状态 409
+不落库、轮空/已提交对局加时校验、截止时刻拒绝赛果、暂停顺延
+截止判定、进程重启后读数连续、计时事件同事务落库），以及事件流
 专项测试——事务回滚不留事件、
 提交失败不广播且不留事件、原子计数器回滚不占号、并发报名/赛果/
 开轮（多线程屏障同时放行）下编号与序号唯一连续、并发提交按序号
