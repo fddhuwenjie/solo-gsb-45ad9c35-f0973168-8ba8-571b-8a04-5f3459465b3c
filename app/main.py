@@ -5,7 +5,7 @@ from fastapi import FastAPI
 
 from .database import init_db
 from .events.bus import event_bus
-from .routers import events, rounds, stations, tournaments
+from .routers import clock, events, rounds, stations, tournaments
 
 
 @asynccontextmanager
@@ -26,9 +26,12 @@ app = FastAPI(
         "支持维护赛事工位（编号/可用状态/能力标签）与参赛者必需标签，"
         "为每一轮发布版本化工位分配方案（最多分配 → 最少换位 → "
         "固定裁决，容量不足时保存最大可行方案并说明原因）。"
+        "支持持久化轮次计时：start/pause/resume/extend 命令经幂等键与"
+        "乐观版本控制落库，剩余时间由服务端 UTC 锚点与累计暂停时长推算，"
+        "重启后读数连续；晚于该场截止时刻的赛果拒绝录入。"
         "另提供每赛事独立序号、可断线续传的 SSE 赛事事件流。"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -41,4 +44,5 @@ def health() -> dict[str, str]:
 app.include_router(tournaments.router)
 app.include_router(rounds.router)
 app.include_router(stations.router)
+app.include_router(clock.router)
 app.include_router(events.router)

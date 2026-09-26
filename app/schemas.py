@@ -1,7 +1,13 @@
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, Field, field_serializer
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    Field,
+    field_serializer,
+    model_validator,
+)
 
 
 def _normalize_tags(tags: list[str]) -> list[str]:
@@ -210,3 +216,84 @@ class StationPlanResponse(BaseModel):
         if v.tzinfo is None:
             v = v.replace(tzinfo=timezone.utc)
         return v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# ---------- Round Clock ----------
+
+def _serialize_utc(v: datetime | None) -> str | None:
+    # 存储为 naive UTC，序列化为带 Z 后缀的 ISO 8601
+    if v is None:
+        return None
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=timezone.utc)
+    return v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class ClockActionRequest(BaseModel):
+    """轮次计时命令：一个请求执行一个命令。
+
+    - start：设定轮次总时长并启动计时（每轮仅一次）；
+    - pause / resume：全局暂停 / 恢复（暂停期间所有对局冻结）；
+    - extend：给指定非轮空对局加时（match_id + seconds）。
+    """
+
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_version: int = Field(
+        ge=0, description="期望的当前时钟版本（未启动时为 0）；不一致返回 409"
+    )
+    action: Literal["start", "pause", "resume", "extend"]
+    # start 参数：轮次总时长（秒）
+    total_seconds: int | None = Field(default=None, ge=1)
+    # extend 参数：目标对局与加时秒数
+    match_id: int | None = None
+    seconds: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _check_action_params(self):
+        if self.action == "start" and self.total_seconds is None:
+            raise ValueError("start 命令必须提供 total_seconds")
+        if self.action == "extend" and (
+            self.match_id is None or self.seconds is None
+        ):
+            raise ValueError("extend 命令必须提供 match_id 和 seconds")
+        return self
+
+
+class ClockMatchResponse(BaseModel):
+    match_id: int
+    # 该场累计加时（extend 叠加，秒）
+    extra_seconds: int
+    # 该场截止时刻（UTC，Z 结尾）；暂停中未知（恢复后才确定）为 null，
+    # 计时未启动也为 null
+    deadline_at: datetime | None = None
+    # 该场剩余秒数（暂停/封盘时为冻结值，超时为负）；未启动为 null
+    remaining_seconds: int | None = None
+
+    @field_serializer("deadline_at")
+    def serialize_deadline_at(self, v: datetime | None) -> str | None:
+        return _serialize_utc(v)
+
+
+class ClockResponse(BaseModel):
+    tournament_id: int
+    round_id: int
+    round_no: int
+    # 时钟版本：每个成功命令 +1；未启动为 0
+    version: int
+    # idle（未启动）/ running / paused / ended（轮次已封盘）
+    status: str
+    total_seconds: int | None = None
+    started_at: datetime | None = None
+    paused_at: datetime | None = None
+    ended_at: datetime | None = None
+    accumulated_pause_seconds: float = 0.0
+    # 服务端当前 UTC 时间，供客户端校准倒计时
+    server_time: datetime
+    # 本轮各非轮空对局的计时（轮空对局不计时）
+    matches: list[ClockMatchResponse] = []
+
+    @field_serializer("started_at", "paused_at", "ended_at", "server_time")
+    def serialize_utc_fields(self, v: datetime | None) -> str | None:
+        return _serialize_utc(v)

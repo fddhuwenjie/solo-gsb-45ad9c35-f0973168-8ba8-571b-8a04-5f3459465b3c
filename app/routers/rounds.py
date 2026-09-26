@@ -11,6 +11,11 @@ from ..events.service import (
 from ..locking import writer_lock
 from ..models import Match, Round
 from ..schemas import ResultUpdate, RoundResponse
+from ..services.clock import (
+    freeze_clock_for_closed_round,
+    get_clock,
+    result_deadline_exceeded,
+)
 from ..services.rounds import generate_next_round
 from .tournaments import get_tournament_or_404, serialize_round
 
@@ -119,9 +124,20 @@ def submit_result(
         if round_obj.status != "open":
             raise HTTPException(status_code=409, detail="该轮次已结束，不能修改赛果")
 
+        # 计时已启动的轮次：晚于该场截止时刻的赛果拒绝录入
+        clock = get_clock(db, round_obj.id)
+        if result_deadline_exceeded(clock, match.id):
+            raise HTTPException(
+                status_code=409,
+                detail="该场对局已超过截止时刻，不能录入赛果",
+            )
+
         match.score_white = sw
         match.score_black = sb
         _try_close_round(db, round_obj)
+        # 封盘时冻结该轮时钟（ended），剩余时间停在封盘时刻
+        if round_obj.status == "closed":
+            freeze_clock_for_closed_round(db, round_obj.id)
 
         events = [
             append_event(

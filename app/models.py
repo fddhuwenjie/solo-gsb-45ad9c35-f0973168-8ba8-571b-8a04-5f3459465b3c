@@ -4,6 +4,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     JSON,
@@ -214,6 +215,80 @@ class StationPlanAssignment(Base):
     station_no: Mapped[int] = mapped_column(Integer, nullable=False)
 
     plan: Mapped[StationPlan] = relationship(back_populates="assignments")
+
+
+class RoundClock(Base):
+    """一轮的计时状态：每轮至多一行，由 start 命令创建。
+
+    剩余时间不在数据库中逐秒更新，而是在读取时由
+    started_at（服务端 UTC 锚点）、accumulated_pause_seconds
+    （累计暂停时长）与 paused_at/ended_at 推算；没有任何后台
+    写库任务，进程/容器重启后读数自然连续。
+    """
+
+    __tablename__ = "round_clocks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    round_id: Mapped[int] = mapped_column(
+        ForeignKey("rounds.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+    # 乐观并发版本：每个成功应用的命令 +1；start 之前行不存在，视为 0
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # running / paused / ended（行由 start 创建，不存在 idle 行）
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    # start 设定的轮次总时长（秒）
+    total_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    # UTC 锚点：计时起点（naive UTC，与库内其他时间戳一致）
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # 累计暂停时长（秒）：resume/封盘时把本段暂停时长计入
+    accumulated_pause_seconds: Mapped[float] = mapped_column(
+        Float, default=0.0, nullable=False
+    )
+    # 暂停时刻（仅 paused 状态有值）；恢复时清空并计入累计暂停
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 轮次封盘时刻（仅 ended 状态有值）：冻结剩余时间
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 各非轮空对局的累计加时：{"<match_id>": seconds}
+    match_extensions: Mapped[dict] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+
+    round: Mapped[Round] = relationship()
+
+
+class ClockAction(Base):
+    """计时命令的幂等记录：同一 request_id 重放时原样返回首次结果。
+
+    记录与计时状态变更、round_clock.* 事件在同一事务中提交；
+    被拒绝的命令（非法状态/版本冲突 409）不落任何记录。
+    """
+
+    __tablename__ = "clock_actions"
+    __table_args__ = (
+        UniqueConstraint("clock_id", "request_id", name="uq_clock_action_request"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    clock_id: Mapped[int] = mapped_column(
+        ForeignKey("round_clocks.id", ondelete="CASCADE"), nullable=False
+    )
+    # 客户端幂等键：同一时钟内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # start / pause / resume / extend
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    expected_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 命令参数指纹：start {"total_seconds": n}；
+    # extend {"match_id": m, "seconds": s}；pause/resume {}
+    params: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    clock: Mapped[RoundClock] = relationship()
 
 
 class EventCounter(Base):
